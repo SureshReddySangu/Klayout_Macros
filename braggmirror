@@ -1,0 +1,305 @@
+# ==========================================================
+# Bragg / Hole Modulated Mirror Generator (FINAL CLEAN)
+# ==========================================================
+
+import pya
+import math
+
+# -----------------------------
+# Default Parameters
+# -----------------------------
+H = 0.6
+a = 0.32
+mod_rat = 0.25
+gap = 0.0
+open_cells = 10
+unit_cells = 15
+close_bragg = 10
+sample_dx = 0.002
+rad = 0.2
+layer_info = (1, 0)
+side = "both"
+structure_type = "Bragg"
+cavity_length = 0.5
+
+
+# ==========================================================
+# Utility
+# ==========================================================
+
+def compute_total_cells():
+    return open_cells + unit_cells + close_bragg
+
+
+def envelope_rate(n, total_cells):
+    if n < open_cells:
+        return mod_rat * n / float(open_cells)
+    elif n < open_cells + unit_cells:
+        return mod_rat
+    elif n < total_cells:
+        down = n - (open_cells + unit_cells)
+        return mod_rat * (1.0 - down / float(close_bragg))
+    return 0.0
+
+
+# ==========================================================
+# Bragg Modulation
+# ==========================================================
+
+def generate_bragg_polygon(total_cells):
+
+    L = a * total_cells
+    steps = int(L / sample_dx)
+
+    upper = []
+    lower = []
+
+    for i in range(steps + 1):
+        x = i * sample_dx
+        if x > L:
+            x = L
+
+        cell_index = min(int(x / a), total_cells - 1)
+        x_rel = x - cell_index * a
+
+        rate = envelope_rate(cell_index, total_cells)
+        h = H/2 + rate * math.sin(2 * math.pi * x_rel / a)
+        h = max(0.0, h)
+
+        upper.append((x, gap/2 + h))
+        lower.append((x, -gap/2 - h))
+
+    lower.reverse()
+    return upper + lower
+
+
+# ==========================================================
+# Hole Modulation (Envelope + Sinusoidal)
+# ==========================================================
+
+def generate_hole_region(layout, total_cells):
+
+    dbu = layout.dbu
+
+    # Waveguide base
+    wg = pya.Box(
+        0,
+        int(-H/2 / dbu),
+        int((a * total_cells) / dbu),
+        int(H/2 / dbu)
+    )
+
+    waveguide_region = pya.Region(wg)
+    holes_region = pya.Region()
+
+    for n in range(total_cells):
+
+        # Envelope
+        env = envelope_rate(n, total_cells)
+
+        # Sinusoidal modulation of radius
+        r = rad + env * rad
+        if r <= 0.05:
+            r = 0.05
+
+        x_center = n * a + a/2
+        r_dbu = int(r / dbu)
+
+        hole = pya.Region(
+            pya.Polygon.ellipse(
+                pya.Box(-r_dbu, -r_dbu, r_dbu, r_dbu),
+                64
+            )
+        )
+
+        hole.move(int(x_center / dbu), 0)
+        holes_region.insert(hole)
+
+    waveguide_region -= holes_region
+    return waveguide_region
+
+
+# ==========================================================
+# Structure Creation
+# ==========================================================
+
+def create_structure(layout):
+
+    dbu = layout.dbu
+    layer = layout.layer(*layer_info)
+    cell = layout.top_cell()
+
+    total_cells = compute_total_cells()
+    L = a * total_cells
+
+    if structure_type == "Bragg":
+
+        poly_pts = generate_bragg_polygon(total_cells)
+
+        if side in ["left", "both"]:
+            pts = [pya.Point(int(x/dbu), int(y/dbu)) for x,y in poly_pts]
+            cell.shapes(layer).insert(pya.Polygon(pts))
+
+        if side in ["right", "both"]:
+
+            shift = L
+            if side == "both":
+                shift = L + cavity_length
+
+            mirrored = [(shift + (L - x), y) for x,y in poly_pts]
+            pts = [pya.Point(int(x/dbu), int(y/dbu)) for x,y in mirrored]
+            cell.shapes(layer).insert(pya.Polygon(pts))
+
+    else:  # Holes
+
+        region = generate_hole_region(layout, total_cells)
+
+        if side in ["left", "both"]:
+            cell.shapes(layer).insert(region)
+
+        if side in ["right", "both"]:
+
+            shift = L
+            if side == "both":
+                shift = L + cavity_length
+
+            moved = pya.Region(region)
+            moved.move(int((shift - L)/dbu), 0)
+            cell.shapes(layer).insert(moved)
+
+
+# ==========================================================
+# Dialog
+# ==========================================================
+
+def show_dialog():
+
+    global H, a, mod_rat, gap
+    global open_cells, unit_cells, close_bragg
+    global sample_dx, rad, layer_info
+    global side, structure_type, cavity_length
+
+    dialog = pya.QDialog()
+    dialog.setWindowTitle("Bragg / Hole Mirror Generator")
+
+    main_layout = pya.QVBoxLayout()
+    form = pya.QFormLayout()
+
+    # Radio buttons
+    bragg_radio = pya.QRadioButton("Bragg Modulation")
+    hole_radio = pya.QRadioButton("Hole Modulation")
+    bragg_radio.setChecked(True)
+
+    radio_layout = pya.QHBoxLayout()
+    radio_layout.addWidget(bragg_radio)
+    radio_layout.addWidget(hole_radio)
+
+    # Side selection
+    side_combo = pya.QComboBox()
+    side_combo.addItems(["both", "left", "right"])
+
+    # Inputs
+    H_edit = pya.QLineEdit(str(H))
+    a_edit = pya.QLineEdit(str(a))
+    mod_edit = pya.QLineEdit(str(mod_rat))
+    gap_edit = pya.QLineEdit(str(gap))
+    open_edit = pya.QLineEdit(str(open_cells))
+    unit_edit = pya.QLineEdit(str(unit_cells))
+    close_edit = pya.QLineEdit(str(close_bragg))
+    dx_edit = pya.QLineEdit(str(sample_dx))
+    rad_edit = pya.QLineEdit(str(rad))
+    layer_edit = pya.QLineEdit(f"{layer_info[0]},{layer_info[1]}")
+    cavity_edit = pya.QLineEdit(str(cavity_length))
+
+    total_label = pya.QLabel(str(compute_total_cells()))
+
+    # Update total cells dynamically
+    def update_total():
+        try:
+            total = int(open_edit.text) + int(unit_edit.text) + int(close_edit.text)
+            total_label.setText(str(total))
+        except:
+            total_label.setText("Invalid")
+
+    open_edit.editingFinished.connect(update_total)
+    unit_edit.editingFinished.connect(update_total)
+    close_edit.editingFinished.connect(update_total)
+
+    form.addRow("Structure:", radio_layout)
+    form.addRow("Side:", side_combo)
+    form.addRow("Height (µm):", H_edit)
+    form.addRow("Period a (µm):", a_edit)
+    form.addRow("Modulation Rate:", mod_edit)
+    form.addRow("Gap (µm):", gap_edit)
+    form.addRow("Open Cells:", open_edit)
+    form.addRow("Unit Cells:", unit_edit)
+    form.addRow("Close Cells:", close_edit)
+    form.addRow("Total Cells:", total_label)
+    form.addRow("Sample DX:", dx_edit)
+    form.addRow("Hole Radius:", rad_edit)
+    form.addRow("Layer (L,D):", layer_edit)
+    form.addRow("Cavity Length (µm):", cavity_edit)
+
+    main_layout.addLayout(form)
+
+    buttons = pya.QDialogButtonBox(dialog)
+    buttons.addButton(pya.QDialogButtonBox.Ok)
+    buttons.addButton(pya.QDialogButtonBox.Cancel)
+    buttons.accepted.connect(dialog.accept)
+    buttons.rejected.connect(dialog.reject)
+
+    main_layout.addWidget(buttons)
+    dialog.setLayout(main_layout)
+
+    if dialog.exec_() != 1:
+        return False
+
+    structure_type = "Bragg" if bragg_radio.isChecked() else "Holes"
+    side = side_combo.currentText
+
+    try:
+        H = float(H_edit.text)
+        a = float(a_edit.text)
+        mod_rat = float(mod_edit.text)
+        gap = float(gap_edit.text)
+        open_cells = int(open_edit.text)
+        unit_cells = int(unit_edit.text)
+        close_bragg = int(close_edit.text)
+        sample_dx = float(dx_edit.text)
+        rad = float(rad_edit.text)
+        layer_info = tuple(map(int, layer_edit.text.split(',')))
+
+        if side == "both":
+            cavity_length = float(cavity_edit.text)
+        else:
+            cavity_length = 0.0
+
+    except:
+        pya.MessageBox.warning("Error", "Invalid input values!", pya.MessageBox.Ok)
+        return False
+
+    return True
+
+
+# ==========================================================
+# Main
+# ==========================================================
+
+def main():
+
+    view = pya.LayoutView.current()
+    if not view:
+        pya.MessageBox.warning("No Layout", "Open a layout first!", pya.MessageBox.Ok)
+        return
+
+    if not show_dialog():
+        return
+
+    layout = view.active_cellview().layout()
+    create_structure(layout)
+
+    view.zoom_fit()
+    pya.MessageBox.info("Done", "Structure Created Successfully!", pya.MessageBox.Ok)
+
+
+main()
