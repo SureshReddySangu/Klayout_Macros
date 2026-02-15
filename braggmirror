@@ -1,5 +1,5 @@
 # ==========================================================
-# Bragg / Hole Modulated Mirror Generator (FINAL CLEAN)
+# Bragg / Hole Mirror Generator (FINAL CLEAN VERSION)
 # ==========================================================
 
 import pya
@@ -74,49 +74,80 @@ def generate_bragg_polygon(total_cells):
 
 
 # ==========================================================
-# Hole Modulation (Envelope + Sinusoidal)
+# Hole Logic (Your Exact Method Converted to KLayout)
 # ==========================================================
 
-def generate_hole_region(layout, total_cells):
+def generate_holes(layout):
 
+    total_cells = compute_total_cells()
     dbu = layout.dbu
+    main_layer = layout.layer(*layer_info)
 
-    # Waveguide base
-    wg = pya.Box(
+    # Temporary hole layer
+    temp_layer_info = (layer_info[0] + 10, 0)
+    temp_layer = layout.layer(*temp_layer_info)
+
+    cell = layout.top_cell()
+
+    L = a * total_cells
+
+    # 1️⃣ Create rectangle (waveguide)
+    rect = pya.Box(
         0,
-        int(-H/2 / dbu),
-        int((a * total_cells) / dbu),
-        int(H/2 / dbu)
+        0,
+        int(L / dbu),
+        int(H / dbu)
     )
 
-    waveguide_region = pya.Region(wg)
-    holes_region = pya.Region()
+    cell.shapes(main_layer).insert(rect)
 
-    for n in range(total_cells):
+    # 2️⃣ Generate holes on temp layer
+    radius_list = []
+    holes_pos = []
 
-        # Envelope
-        env = envelope_rate(n, total_cells)
+    for n in range(1, total_cells + 1):
 
-        # Sinusoidal modulation of radius
-        r = rad + env * rad
-        if r <= 0.05:
-            r = 0.05
+        if n < open_cells:
+            r = rad * n / open_cells
+            if r <= 0.1:
+                r = 0.1
 
-        x_center = n * a + a/2
+        elif n >= open_cells + unit_cells:
+            r = rad * (total_cells + 1 - n) / open_cells
+            if r <= 0.1:
+                r = 0.1
+        else:
+            r = rad
+
+        radius_list.append(r)
+        holes_pos.append((n * a, H / 2))
+
+    for r, pos in zip(radius_list, holes_pos):
+
         r_dbu = int(r / dbu)
+        x_dbu = int(pos[0] / dbu)
+        y_dbu = int(pos[1] / dbu)
 
-        hole = pya.Region(
-            pya.Polygon.ellipse(
-                pya.Box(-r_dbu, -r_dbu, r_dbu, r_dbu),
-                64
-            )
+        hole = pya.Polygon.ellipse(
+            pya.Box(-r_dbu, -r_dbu, r_dbu, r_dbu),
+            64
         )
 
-        hole.move(int(x_center / dbu), 0)
-        holes_region.insert(hole)
+        hole.move(x_dbu, y_dbu)
+        cell.shapes(temp_layer).insert(hole)
 
-    waveguide_region -= holes_region
-    return waveguide_region
+    # 3️⃣ Boolean A - B
+    wg_region = pya.Region(cell.begin_shapes_rec(main_layer))
+    hole_region = pya.Region(cell.begin_shapes_rec(temp_layer))
+
+    result = wg_region - hole_region
+
+    # Clear original shapes
+    cell.shapes(main_layer).clear()
+    cell.shapes(temp_layer).clear()
+
+    # Insert final result
+    cell.shapes(main_layer).insert(result)
 
 
 # ==========================================================
@@ -150,26 +181,13 @@ def create_structure(layout):
             pts = [pya.Point(int(x/dbu), int(y/dbu)) for x,y in mirrored]
             cell.shapes(layer).insert(pya.Polygon(pts))
 
-    else:  # Holes
+    else:
 
-        region = generate_hole_region(layout, total_cells)
-
-        if side in ["left", "both"]:
-            cell.shapes(layer).insert(region)
-
-        if side in ["right", "both"]:
-
-            shift = L
-            if side == "both":
-                shift = L + cavity_length
-
-            moved = pya.Region(region)
-            moved.move(int((shift - L)/dbu), 0)
-            cell.shapes(layer).insert(moved)
+        generate_holes(layout)
 
 
 # ==========================================================
-# Dialog
+# Dialog (Clean Layout + Conditional Cavity Field)
 # ==========================================================
 
 def show_dialog():
@@ -185,7 +203,7 @@ def show_dialog():
     main_layout = pya.QVBoxLayout()
     form = pya.QFormLayout()
 
-    # Radio buttons
+    # Structure radio buttons
     bragg_radio = pya.QRadioButton("Bragg Modulation")
     hole_radio = pya.QRadioButton("Hole Modulation")
     bragg_radio.setChecked(True)
@@ -198,22 +216,24 @@ def show_dialog():
     side_combo = pya.QComboBox()
     side_combo.addItems(["both", "left", "right"])
 
-    # Inputs
+    # Inputs for common fields (Bragg and Hole)
     H_edit = pya.QLineEdit(str(H))
     a_edit = pya.QLineEdit(str(a))
     mod_edit = pya.QLineEdit(str(mod_rat))
-    gap_edit = pya.QLineEdit(str(gap))
     open_edit = pya.QLineEdit(str(open_cells))
     unit_edit = pya.QLineEdit(str(unit_cells))
     close_edit = pya.QLineEdit(str(close_bragg))
-    dx_edit = pya.QLineEdit(str(sample_dx))
+    total_label = pya.QLabel(str(compute_total_cells()))
+    gap_edit = pya.QLineEdit(str(gap))  # Only for Bragg
+    sample_dx_edit = pya.QLineEdit(str(sample_dx))  # Only for Bragg
+    cavity_label = pya.QLabel("Cavity Length (µm):")
+    cavity_edit = pya.QLineEdit(str(cavity_length))  # Always visible
+
+    # Inputs for Hole Modulation fields
     rad_edit = pya.QLineEdit(str(rad))
     layer_edit = pya.QLineEdit(f"{layer_info[0]},{layer_info[1]}")
-    cavity_edit = pya.QLineEdit(str(cavity_length))
 
-    total_label = pya.QLabel(str(compute_total_cells()))
-
-    # Update total cells dynamically
+    # Update total cells label
     def update_total():
         try:
             total = int(open_edit.text) + int(unit_edit.text) + int(close_edit.text)
@@ -225,20 +245,78 @@ def show_dialog():
     unit_edit.editingFinished.connect(update_total)
     close_edit.editingFinished.connect(update_total)
 
+    # Hide cavity initially
+    cavity_label.setVisible(True)
+    cavity_edit.setVisible(True)
+
+    def update_cavity_visibility():
+        if side_combo.currentText == "both":
+            cavity_label.setVisible(True)
+            cavity_edit.setVisible(True)
+        else:
+            cavity_label.setVisible(True)  # Always visible
+            cavity_edit.setVisible(True)  # Always visible
+
+    side_combo.currentIndexChanged.connect(update_cavity_visibility)
+    update_cavity_visibility()
+
+    # Show/hide fields based on structure type
+    def update_fields():
+        if bragg_radio.isChecked():
+            # Show Bragg related fields
+            gap_edit.setVisible(True)
+            sample_dx_edit.setVisible(True)
+
+            # Show common fields
+            H_edit.setVisible(True)
+            a_edit.setVisible(True)
+            mod_edit.setVisible(True)
+            open_edit.setVisible(True)
+            unit_edit.setVisible(True)
+            close_edit.setVisible(True)
+            total_label.setVisible(True)
+
+            # Hide Hole related fields
+            rad_edit.setVisible(False)
+            layer_edit.setVisible(False)
+
+        elif hole_radio.isChecked():
+            # Show Hole related fields
+            rad_edit.setVisible(True)
+            layer_edit.setVisible(True)
+
+            # Show common fields
+            H_edit.setVisible(True)
+            a_edit.setVisible(True)
+            mod_edit.setVisible(True)
+            open_edit.setVisible(True)
+            unit_edit.setVisible(True)
+            close_edit.setVisible(True)
+            total_label.setVisible(True)
+
+            # Hide Bragg related fields
+            gap_edit.setVisible(False)
+            sample_dx_edit.setVisible(False)
+
+    bragg_radio.toggled.connect(update_fields)
+    hole_radio.toggled.connect(update_fields)
+    update_fields()
+
+    # Arrange form nicely
     form.addRow("Structure:", radio_layout)
     form.addRow("Side:", side_combo)
     form.addRow("Height (µm):", H_edit)
     form.addRow("Period a (µm):", a_edit)
     form.addRow("Modulation Rate:", mod_edit)
-    form.addRow("Gap (µm):", gap_edit)
     form.addRow("Open Cells:", open_edit)
     form.addRow("Unit Cells:", unit_edit)
     form.addRow("Close Cells:", close_edit)
     form.addRow("Total Cells:", total_label)
-    form.addRow("Sample DX:", dx_edit)
+    form.addRow("Gap (µm):", gap_edit)
+    form.addRow("Sample DX:", sample_dx_edit)
     form.addRow("Hole Radius:", rad_edit)
     form.addRow("Layer (L,D):", layer_edit)
-    form.addRow("Cavity Length (µm):", cavity_edit)
+    form.addRow(cavity_label, cavity_edit)
 
     main_layout.addLayout(form)
 
@@ -258,27 +336,27 @@ def show_dialog():
     side = side_combo.currentText
 
     try:
-        H = float(H_edit.text)
-        a = float(a_edit.text)
-        mod_rat = float(mod_edit.text)
-        gap = float(gap_edit.text)
-        open_cells = int(open_edit.text)
-        unit_cells = int(unit_edit.text)
-        close_bragg = int(close_edit.text)
-        sample_dx = float(dx_edit.text)
-        rad = float(rad_edit.text)
-        layer_info = tuple(map(int, layer_edit.text.split(',')))
-
-        if side == "both":
-            cavity_length = float(cavity_edit.text)
+        # Get values based on selected modulation type
+        if bragg_radio.isChecked():
+            H = float(H_edit.text)  # Correct use of .text
+            a = float(a_edit.text)  # Correct use of .text
+            mod_rat = float(mod_edit.text)  # Correct use of .text
+            gap = float(gap_edit.text)  # Correct use of .text
+            open_cells = int(open_edit.text)  # Correct use of .text
+            unit_cells = int(unit_edit.text)  # Correct use of .text
+            close_bragg = int(close_edit.text)  # Correct use of .text
+            sample_dx = float(sample_dx_edit.text)  # Correct use of .text
+            cavity_length = float(cavity_edit.text)  # Correct use of .text
         else:
-            cavity_length = 0.0
+            rad = float(rad_edit.text)  # Correct use of .text
+            layer_info = tuple(map(int, layer_edit.text.split(',')))  # Correct use of .text
 
     except:
         pya.MessageBox.warning("Error", "Invalid input values!", pya.MessageBox.Ok)
         return False
 
     return True
+
 
 
 # ==========================================================
