@@ -102,26 +102,25 @@ def generate_holes(layout, side_param="both"):
 
     for n in range(total_cells):
         x_cell = n * a
-
-        # **NEW ENVELOPE - 0→1→0**
         envelope = hole_envelope(n, open_cells, unit_cells, close_bragg)
-        radius = max(0.1, rad * envelope) # Now works!
+        radius = max(0.1, rad * envelope)
 
         print(f"Hole {n}: envelope={envelope:.3f}, radius={radius:.3f}μm")
 
-        # left/right/both positioning...
         positions = []
         if side_param in ["left", "both"]:
-            positions.append(0)
+            positions.append(0)  # Left mirror at x=0
+        
         if side_param in ["right", "both"]:
-            shift = L + cavity_length if side_param == "both" else L
+            # **FIXED: ALWAYS shift by cavity_length for right side**
+            shift = L + cavity_length  
             positions.append(shift)
 
         for base_x in positions:
             x_pos = base_x + x_cell
             r_dbu = int(radius / dbu)
             x_dbu = int(x_pos / dbu)
-            y_dbu = int(H * 0.5 / dbu)
+            y_dbu = 0
 
             hole_box = pya.Box(x_dbu - r_dbu, y_dbu - r_dbu,
                              x_dbu + r_dbu, y_dbu + r_dbu)
@@ -130,7 +129,8 @@ def generate_holes(layout, side_param="both"):
     
     print(f"Total cells: {compute_total_cells()}")
     print(f"Holes per mirror: {compute_total_cells()}")
-    print(f"Side: {side_param}")
+    print(f"Side: {side_param}, Right shift: {L + cavity_length}")
+
 
 def generate_holes_left_only(layout):
     """Holes only on left side"""
@@ -437,8 +437,18 @@ def show_dialog():
         layer_info = tuple(map(int, layer_edit.text.split(',')))
 
         # Configuration
-        left_type = left_combo.currentText
-        right_type = right_combo.currentText
+        #left_type = left_combo.currentText
+        #right_type = right_combo.currentText
+         # **FIX: Set left_type/right_type based on radio selection**
+        if bragg_radio.isChecked():
+            left_type = "bragg"
+            right_type = "bragg"
+        elif hole_radio.isChecked():
+            left_type = "hole"
+            right_type = "hole"
+        elif mixed_radio.isChecked():
+            left_type = left_combo.currentText()
+            right_type = right_combo.currentText()
         cavity_tapering = "tapering" if tapering_yes_radio.isChecked() else "no_tapering"
         if cavity_tapering == "tapering":
             tapering_type = tapering_combo.currentText
