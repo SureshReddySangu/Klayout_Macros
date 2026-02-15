@@ -1,0 +1,61 @@
+import pya
+
+layerA_num = 13 # layer numbre
+layerA_dt = 0 # layer data type
+layerB_num = 15
+layerB_dt = 0
+layerC_num = 30
+layerC_dt = 0
+
+
+# get the current layout view
+my_view = pya.Application.instance().main_window()
+view = my_view.current_view()
+
+if view is None:
+  raise Exception("No active cell")
+
+cv = view.active_cellview()
+layout = cv.layout()
+cell= cv.cell
+ 
+if cell is None:
+  raise Exception("No active cell")
+
+# get layer indexes
+layerA = layout.layer(layerA_num, layerA_dt)
+layerB = layout.layer(layerB_num, layerB_dt)
+layerC = layout.layer(layerC_num, layerC_dt)
+#collect the shapes into regions
+regionA= pya.Region()
+regionB= pya.Region()
+regionC= pya.Region()
+
+for shape in cell.shapes(layerA):
+  if shape.is_polygon() or shape.is_box() or shape.is_path():
+    regionA.insert(shape.polygon)
+
+for shape in cell.shapes(layerB):
+  if shape.is_polygon() or shape.is_box() or shape.is_path():
+    regionB.insert(shape.polygon)
+
+for shape in cell.shapes(layerC):
+  if shape.is_polygon() or shape.is_box() or shape.is_path():
+    regionC.insert(shape.polygon)
+
+
+#perform not operation
+result1 = regionA-regionB
+result2 = result1-regionC
+# clear orgianl layer A with new layer
+cell.shapes(layerA).clear()
+#write the result back to layer A
+cell.shapes(layerA).insert(result2)
+
+#refresh the view
+view.add_missing_layers()
+view.zoom_fit()
+
+print("Boolena NOT operation completed: Layer{}/{} reaplced.".format(layerA_num, layerA_dt))
+
+
