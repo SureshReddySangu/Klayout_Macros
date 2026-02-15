@@ -29,18 +29,29 @@ cavity_length = 0.5
 
 def compute_total_cells():
     return open_cells + unit_cells + close_bragg
-
-
 def envelope_rate(n, total_cells):
     if n < open_cells:
-        return mod_rat * n / float(open_cells)
+        return float(n) / open_cells * mod_rat  # 0 → mod_rat
     elif n < open_cells + unit_cells:
-        return mod_rat
-    elif n < total_cells:
-        down = n - (open_cells + unit_cells)
-        return mod_rat * (1.0 - down / float(close_bragg))
-    return 0.0
+        return mod_rat                         # plateau
+    else:
+        remaining = total_cells - (open_cells + unit_cells)
+        progress = float(n - (open_cells + unit_cells)) / remaining
+        return mod_rat * (1.0 - progress)      # mod_rat → 0
 
+def hole_envelope(n, open_cells, unit_cells, close_bragg):
+    """
+    NEW: Always ramps 0→1→0 - ignores mod_rat
+    """
+    total_cells = open_cells + unit_cells + close_bragg
+    
+    if n < open_cells:
+        return float(n) / open_cells              # 0 → 1
+    elif n < open_cells + unit_cells:
+        return 1.0                               # PLATEAU at 1.0
+    else:
+        down_progress = float(n - (open_cells + unit_cells)) / close_bragg
+        return 1.0 - down_progress  
 
 # ==========================================================
 # Bragg Modulation
@@ -77,85 +88,58 @@ def generate_bragg_polygon(total_cells):
 # Hole Logic (Your Exact Method Converted to KLayout)
 # ==========================================================
 
-def generate_holes(layout):
+def compute_total_cells():
+    return open_cells + unit_cells + close_bragg
 
-    total_cells = compute_total_cells()
+
+def generate_holes(layout):
+    total_cells = open_cells + unit_cells + close_bragg
+    L = a * total_cells
     dbu = layout.dbu
     main_layer = layout.layer(*layer_info)
-
-    # Temporary hole layer
-    temp_layer_info = (layer_info[0] + 10, 0)
-    temp_layer = layout.layer(*temp_layer_info)
-
     cell = layout.top_cell()
+    
+    print(f"DEBUG: rad={rad}, open={open_cells}, unit={unit_cells}, close={close_bragg}")
+    
+    for n in range(total_cells):
+        x_cell = n * a
+        
+        # **NEW ENVELOPE - 0→1→0**
+        envelope = hole_envelope(n, open_cells, unit_cells, close_bragg)
+        radius = max(0.1, rad * envelope)  # Now works!
+        
+        print(f"Hole {n}: envelope={envelope:.3f}, radius={radius:.3f}μm")
+        
+        # left/right/both positioning...
+        positions = []
+        if side in ["left", "both"]:
+            positions.append(0)
+        if side in ["right", "both"]:
+            shift = L + cavity_length if side == "both" else L
+            positions.append(shift)
+        
+        for base_x in positions:
+            x_pos = base_x + x_cell
+            r_dbu = int(radius / dbu)
+            x_dbu = int(x_pos / dbu)
+            y_dbu = int(H * 0.5 / dbu)
+            
+            hole_box = pya.Box(x_dbu - r_dbu, y_dbu - r_dbu, 
+                             x_dbu + r_dbu, y_dbu + r_dbu)
+            hole = pya.Polygon.ellipse(hole_box, 32)
+            cell.shapes(main_layer).insert(hole)
+print(f"Total cells: {compute_total_cells()}")
+print(f"Holes per mirror: {compute_total_cells()}")
+print(f"Side: {side}")
 
-    L = a * total_cells
-
-    # 1️⃣ Create rectangle (waveguide)
-    rect = pya.Box(
-        0,
-        0,
-        int(L / dbu),
-        int(H / dbu)
-    )
-
-    cell.shapes(main_layer).insert(rect)
-
-    # 2️⃣ Generate holes on temp layer
-    radius_list = []
-    holes_pos = []
-
-    for n in range(1, total_cells + 1):
-
-        if n < open_cells:
-            r = rad * n / open_cells
-            if r <= 0.1:
-                r = 0.1
-
-        elif n >= open_cells + unit_cells:
-            r = rad * (total_cells + 1 - n) / open_cells
-            if r <= 0.1:
-                r = 0.1
-        else:
-            r = rad
-
-        radius_list.append(r)
-        holes_pos.append((n * a, H / 2))
-
-    for r, pos in zip(radius_list, holes_pos):
-
-        r_dbu = int(r / dbu)
-        x_dbu = int(pos[0] / dbu)
-        y_dbu = int(pos[1] / dbu)
-
-        hole = pya.Polygon.ellipse(
-            pya.Box(-r_dbu, -r_dbu, r_dbu, r_dbu),
-            64
-        )
-
-        hole.move(x_dbu, y_dbu)
-        cell.shapes(temp_layer).insert(hole)
-
-    # 3️⃣ Boolean A - B
-    wg_region = pya.Region(cell.begin_shapes_rec(main_layer))
-    hole_region = pya.Region(cell.begin_shapes_rec(temp_layer))
-
-    result = wg_region - hole_region
-
-    # Clear original shapes
-    cell.shapes(main_layer).clear()
-    cell.shapes(temp_layer).clear()
-
-    # Insert final result
-    cell.shapes(main_layer).insert(result)
 
 
 # ==========================================================
 # Structure Creation
 # ==========================================================
 
+# Main Structure Creation Logic (inside show_dialog)
 def create_structure(layout):
-
     dbu = layout.dbu
     layer = layout.layer(*layer_info)
     cell = layout.top_cell()
@@ -164,31 +148,74 @@ def create_structure(layout):
     L = a * total_cells
 
     if structure_type == "Bragg":
-
         poly_pts = generate_bragg_polygon(total_cells)
 
         if side in ["left", "both"]:
-            pts = [pya.Point(int(x/dbu), int(y/dbu)) for x,y in poly_pts]
+            pts = [pya.Point(int(x/dbu), int(y/dbu)) for x, y in poly_pts]
             cell.shapes(layer).insert(pya.Polygon(pts))
 
         if side in ["right", "both"]:
-
             shift = L
             if side == "both":
                 shift = L + cavity_length
 
-            mirrored = [(shift + (L - x), y) for x,y in poly_pts]
-            pts = [pya.Point(int(x/dbu), int(y/dbu)) for x,y in mirrored]
+            mirrored = [(shift + (L - x), y) for x, y in poly_pts]
+            pts = [pya.Point(int(x/dbu), int(y/dbu)) for x, y in mirrored]
             cell.shapes(layer).insert(pya.Polygon(pts))
 
     else:
+        generate_holes(layout)  # Create Hole structure
 
-        generate_holes(layout)
+
+from PyQt5.QtGui import QPainter, QColor
+from PyQt5.QtCore import QRect
+
+# -------------------------------
+# Preview Widget Class
+# -------------------------------
+
+class PreviewWidget(pya.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(200, 200)  # Minimum size for the preview box
+        self.structure_data = None  # Placeholder for structure data to be drawn
+
+    def set_structure_data(self, structure_data):
+        self.structure_data = structure_data
+        self.update()  # Repaint the widget with new structure data
+
+    def paintEvent(self, event):
+        if not self.structure_data:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QColor(0, 0, 0))  # Black color for outline
+        painter.setBrush(QColor(150, 150, 150, 50))  # Light grey fill for preview
+
+        # Draw the structure based on the data (structure_data should be a list of points/polygons)
+        for shape in self.structure_data:
+            if isinstance(shape, list):  # List of points (Bragg cells or holes)
+                polygon = pya.Polygon([pya.Point(int(x), int(y)) for x, y in shape])
+                painter.drawPolygon(polygon)
+            elif isinstance(shape, tuple):  # Single rectangular shape
+                rect = shape
+                painter.drawRect(rect[0], rect[1], rect[2], rect[3])  # Draw the outline box
+
+        painter.end()
 
 
 # ==========================================================
 # Dialog (Clean Layout + Conditional Cavity Field)
 # ==========================================================
+
+# -------------------------------
+# Modify show_dialog function
+# -------------------------------
+
+# -------------------------------
+# Modify show_dialog function
+# -------------------------------
 
 def show_dialog():
 
@@ -332,31 +359,39 @@ def show_dialog():
     if dialog.exec_() != 1:
         return False
 
-    structure_type = "Bragg" if bragg_radio.isChecked() else "Holes"
-    side = side_combo.currentText
+
 
     try:
         # Get values based on selected modulation type
-        if bragg_radio.isChecked():
-            H = float(H_edit.text)  # Correct use of .text
-            a = float(a_edit.text)  # Correct use of .text
-            mod_rat = float(mod_edit.text)  # Correct use of .text
-            gap = float(gap_edit.text)  # Correct use of .text
-            open_cells = int(open_edit.text)  # Correct use of .text
-            unit_cells = int(unit_edit.text)  # Correct use of .text
-            close_bragg = int(close_edit.text)  # Correct use of .text
-            sample_dx = float(sample_dx_edit.text)  # Correct use of .text
-            cavity_length = float(cavity_edit.text)  # Correct use of .text
-        else:
-            rad = float(rad_edit.text)  # Correct use of .text
-            layer_info = tuple(map(int, layer_edit.text.split(',')))  # Correct use of .text
+        #if bragg_radio.isChecked():
+        H = float(H_edit.text)  # Correct use of .text
+        a = float(a_edit.text)  # Correct use of .text
+        mod_rat = float(mod_edit.text)  # Correct use of .text
+        gap = float(gap_edit.text)  # Correct use of .text
+        open_cells = int(open_edit.text)  # Correct use of .text
+        unit_cells = int(unit_edit.text)  # Correct use of .text
+        close_bragg = int(close_edit.text)  # Correct use of .text
+        sample_dx = float(sample_dx_edit.text)  # Correct use of .text
+        cavity_length = float(cavity_edit.text)  # Correct use of .text
+        #else:
+        rad = float(rad_edit.text)  # Correct use of .text
+        layer_info = tuple(map(int, layer_edit.text.split(',')))  # Correct use of .text
 
+        
     except:
         pya.MessageBox.warning("Error", "Invalid input values!", pya.MessageBox.Ok)
         return False
+    structure_type = "Bragg" if bragg_radio.isChecked() else "Hole"
+    side = side_combo.currentText
+    
+    # Now apply the modifications in KLayout
+    layout = pya.LayoutView.current().active_cellview().layout()
+    if structure_type == "Bragg":
+        create_structure(layout)  # Create Bragg structure
+    else:
+        generate_holes(layout)
 
     return True
-
 
 
 # ==========================================================
