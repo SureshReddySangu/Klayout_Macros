@@ -1,0 +1,266 @@
+import pya
+
+# ----------------------------
+# Configuration
+# ----------------------------
+TEMP_CELL_NAME = "Temp_rect_array_Cell"
+# ----------------------------
+
+def measure_device_on_layer(cell, layer_index):
+    shapes = cell.shapes(layer_index)
+    if shapes.is_empty():
+        return None
+
+    first = True
+    bbox = None
+    for s in shapes.each():
+        sb = s.bbox()
+        if first:
+            bbox = sb
+            first = False
+        else:
+            bbox = bbox + sb
+
+    return {
+        "left_x": bbox.left,
+        "right_x": bbox.right,
+        "center_x": bbox.center().x,
+        "center_y": bbox.center().y,
+        "length": bbox.right - bbox.left,
+    }
+
+# Get current view and active cell
+app = pya.Application.instance()
+mw = app.main_window()
+view = mw.current_view()
+if view is None:
+    raise Exception("No layout view open")
+
+cv = view.active_cellview()
+layout = cv.layout()
+cell = cv.cell
+if cell is None:
+    raise Exception("No active cell")
+
+dbu = layout.dbu
+
+# NEW: Dialog for DEVICE LAYER (measurement)
+layer1_dialog = pya.QDialog(mw)
+layer1_dialog.setWindowTitle("Select Device Layer (for measurement)")
+layer_form1 = pya.QFormLayout(layer1_dialog)
+
+dev_layer_num_edit = pya.QLineEdit("30")
+dev_layer_dt_edit = pya.QLineEdit("0")
+
+layer_form1.addRow("Device Layer number:", dev_layer_num_edit)
+layer_form1.addRow("Device Datatype:", dev_layer_dt_edit)
+
+layer1_buttons = pya.QDialogButtonBox()
+layer1_buttons.addButton("OK", pya.QDialogButtonBox.AcceptRole)
+layer1_buttons.addButton("Cancel", pya.QDialogButtonBox.RejectRole)
+layer_form1.addRow(layer1_buttons)
+layer1_buttons.accepted.connect(layer1_dialog.accept)
+layer1_buttons.rejected.connect(layer1_dialog.reject)
+
+layer1_result = layer1_dialog.exec_()
+if layer1_result != 1:
+    raise Exception("Device layer selection cancelled.")
+
+# NEW: Dialog for RECTANGLE LAYER (drawing)
+layer2_dialog = pya.QDialog(mw)
+layer2_dialog.setWindowTitle("Select Rectangle Layer")
+layer_form2 = pya.QFormLayout(layer2_dialog)
+
+rect_layer_num_edit = pya.QLineEdit("40")
+rect_layer_dt_edit = pya.QLineEdit("0")
+
+layer_form2.addRow("Rectangle Layer number:", rect_layer_num_edit)
+layer_form2.addRow("Rectangle Datatype:", rect_layer_dt_edit)
+
+layer2_buttons = pya.QDialogButtonBox()
+layer2_buttons.addButton("OK", pya.QDialogButtonBox.AcceptRole)  # CORRECT!
+
+layer2_buttons.addButton("Cancel", pya.QDialogButtonBox.RejectRole)
+layer_form2.addRow(layer2_buttons)
+layer2_buttons.accepted.connect(layer2_dialog.accept)
+layer2_buttons.rejected.connect(layer2_dialog.reject)
+
+layer2_result = layer2_dialog.exec_()
+if layer2_result != 1:
+    raise Exception("Rectangle layer selection cancelled.")
+
+# Parse layers using YOUR ORIGINAL WORKING METHOD
+def get_text_safe(edit_widget):
+    return edit_widget.property("text")
+
+dev_layer_num_str = get_text_safe(dev_layer_num_edit)
+dev_layer_dt_str = get_text_safe(dev_layer_dt_edit)
+rect_layer_num_str = get_text_safe(rect_layer_num_edit)
+rect_layer_dt_str = get_text_safe(rect_layer_dt_edit)
+
+dev_layer_num = int(float(dev_layer_num_str))
+dev_layer_dt = int(float(dev_layer_dt_str))
+rect_layer_num = int(float(rect_layer_num_str))
+rect_layer_dt = int(float(rect_layer_dt_str))
+
+dev_layer_index = layout.find_layer(pya.LayerInfo(dev_layer_num, dev_layer_dt))
+rect_layer_index = layout.find_layer(pya.LayerInfo(rect_layer_num, rect_layer_dt))
+if rect_layer_index is None or rect_layer_index < 0:
+    rect_layer_index = layout.layer(pya.LayerInfo(rect_layer_num, rect_layer_dt))
+
+
+# MEASURE devices on device layer
+dev_info = measure_device_on_layer(cell, dev_layer_index)
+if dev_info is None:
+    raise Exception("No shapes on device layer {} / {}".format(dev_layer_num, dev_layer_dt))
+
+dev_length_um = dev_info["length"] * dbu
+dev_center_x_um = dev_info["center_x"] * dbu
+dev_center_y_um = dev_info["center_y"] * dbu
+
+# YOUR ORIGINAL DIALOG with additions
+dialog = pya.QDialog(mw)
+dialog.setWindowTitle("Rectangle Array Generator")
+layout_form = pya.QFormLayout(dialog)
+
+width_edit = pya.QLineEdit("1.0")
+height_edit = pya.QLineEdit("1.0")
+origin_x_edit = pya.QLineEdit("%.3f" % dev_center_x_um)  # Default to device center
+origin_y_edit = pya.QLineEdit("%.3f" % dev_center_y_um)
+offset_edit = pya.QLineEdit("5.0")
+columns_spin = pya.QSpinBox()
+columns_spin.setValue(5)
+columns_spin.setMinimum(1)
+rows_spin = pya.QSpinBox()
+rows_spin.setValue(5)
+rows_spin.setMinimum(1)
+pitch_x_edit = pya.QLineEdit("10.0")
+pitch_y_edit = pya.QLineEdit("10.0")
+
+# NEW: Show measured device length
+device_length_edit = pya.QLineEdit("%.3f" % dev_length_um)
+device_length_edit.setReadOnly(True)
+
+# NEW: Auto offset button
+auto_offset_button = pya.QPushButton("Auto from device")
+def update_offset_from_device():
+    try:
+        rect_width_um = float(width_edit.property("text"))
+        offset_um = 0.5 * (rect_width_um + dev_length_um)
+        offset_edit.setProperty("text", "%.3f" % offset_um)
+    except:
+        pass
+auto_offset_button.clicked.connect(update_offset_from_device)
+
+layout_form.addRow("Rectangle Width (µm):", width_edit)
+layout_form.addRow("Rectangle Height (µm):", height_edit)
+layout_form.addRow("Origin X (µm):", origin_x_edit)
+layout_form.addRow("Origin Y (µm):", origin_y_edit)
+layout_form.addRow("Device length (µm):", device_length_edit)  # NEW
+layout_form.addRow("Left/Right Offset (µm):", offset_edit)
+layout_form.addRow("", auto_offset_button)  # NEW
+layout_form.addRow("Columns:", columns_spin)
+layout_form.addRow("Rows:", rows_spin)
+layout_form.addRow("Pitch X (µm):", pitch_x_edit)
+layout_form.addRow("Pitch Y (µm):", pitch_y_edit)
+
+buttons = pya.QDialogButtonBox()
+buttons.addButton("OK", pya.QDialogButtonBox.AcceptRole)
+buttons.addButton("Cancel", pya.QDialogButtonBox.RejectRole)
+layout_form.addRow(buttons)
+buttons.accepted.connect(dialog.accept)
+buttons.rejected.connect(dialog.reject)
+
+result = dialog.exec_()
+if result != 1:
+    raise Exception("User cancelled.")
+
+# YOUR ORIGINAL PARSING (exactly the same)
+def um_to_dbu(um_str):
+    try:
+        return float(um_str) / dbu
+    except:
+        return 0.0
+
+width_um_str = get_text_safe(width_edit)
+height_um_str = get_text_safe(height_edit)
+origin_x_um_str = get_text_safe(origin_x_edit)
+origin_y_um_str = get_text_safe(origin_y_edit)
+offset_um_str = get_text_safe(offset_edit)
+pitch_x_um_str = get_text_safe(pitch_x_edit)
+pitch_y_um_str = get_text_safe(pitch_y_edit)
+
+width_dbu = um_to_dbu(width_um_str)
+height_dbu = um_to_dbu(height_um_str)
+origin_x_dbu = um_to_dbu(origin_x_um_str)
+origin_y_dbu = um_to_dbu(origin_y_um_str)
+offset_dbu = um_to_dbu(offset_um_str)
+pitch_x_dbu = um_to_dbu(pitch_x_um_str)
+pitch_y_dbu = um_to_dbu(pitch_y_um_str)
+
+columns = int(columns_spin.property("value"))
+rows = int(rows_spin.property("value"))
+
+# Layout editing
+layout.start_changes()
+
+if layout.has_cell(TEMP_CELL_NAME):
+    temp_cell = layout.cell(layout.cell_by_name(TEMP_CELL_NAME))
+    temp_cell.shapes(rect_layer_index).clear()  # NEW: use rect layer
+else:
+    temp_cell = layout.create_cell(TEMP_CELL_NAME)
+
+left_center_x_dbu = origin_x_dbu - offset_dbu
+right_center_x_dbu = origin_x_dbu + offset_dbu
+center_y_dbu = origin_y_dbu
+
+half_w_dbu = int(width_dbu / 2)
+half_h_dbu = int(height_dbu / 2)
+
+left_rect = pya.Box(
+    int(left_center_x_dbu - half_w_dbu),
+    int(center_y_dbu - half_h_dbu),
+    int(left_center_x_dbu + half_w_dbu),
+    int(center_y_dbu + half_h_dbu)
+)
+
+right_rect = pya.Box(
+    int(right_center_x_dbu - half_w_dbu),
+    int(center_y_dbu - half_h_dbu),
+    int(right_center_x_dbu + half_w_dbu),
+    int(center_y_dbu + half_h_dbu)
+)
+
+temp_cell.shapes(rect_layer_index).insert(left_rect)  # NEW: rect layer
+temp_cell.shapes(rect_layer_index).insert(right_rect)
+
+# Remove old instances
+to_delete = []
+for inst in cell.each_inst():
+    if inst.cell_index == temp_cell.cell_index():
+        to_delete.append(inst)
+for inst in to_delete:
+    cell.erase(inst)
+
+device_center_x = dev_info["center_x"]
+device_center_y = dev_info["center_y"]
+array_geo_offset_x = (columns - 1) * pitch_x_dbu / 2.0
+array_geo_offset_y = (rows - 1) * pitch_y_dbu / 2.0
+array_origin_x_dbu = device_center_x - array_geo_offset_x
+array_origin_y_dbu = device_center_y - array_geo_offset_y
+
+array_trans = pya.Trans(pya.Point(int(array_origin_x_dbu), int(array_origin_y_dbu)))
+inst_array = pya.CellInstArray(
+    temp_cell.cell_index(),
+    array_trans,
+    pya.Vector(int(pitch_x_dbu), 0),
+    pya.Vector(0, int(pitch_y_dbu)),
+    columns,
+    rows
+)
+cell.insert(inst_array)
+view.add_missing_layers()  # ADD THIS
+view.zoom_fit()            # ADD THIS
+
+layout.end_changes()
+
