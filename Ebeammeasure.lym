@@ -17,14 +17,15 @@
  <dsl-interpreter-name/>
  <text># ==========================================================
 # EBL Write Time Calculator (JEOL-9500 Excel-Based Estimator)
-# UI polish + constraint highlight:
-#   - Per-group beam pitch (Shot A units) + computed pitch [nm]
-#   - Compact layer lists (left), info grid (right)
-#   - Status/advice banner if f &gt; 200 MHz or shot time &lt; 5 ns
-#   - Threshold current note
+# Features:
+#   - Cell selection (shows current cell name, can switch if multiple cells exist)
+#   - Numerically ordered layers by (Layer, Datatype)
+#   - Single/Double current modes with per-group beam pitch (Shot A units)
+#   - Compact layer lists (left) + info panel (right)
+#   - Constraint banners if f &gt; 200 MHz or shot &lt; 5 ns with actionable advice
 # Notes:
-#   - All QLineEdit reads use `.text` (NO parentheses) per your environment
-#   - Areas from active cell only (non-recursive)
+#   - All QLineEdit reads use `.text` (NO parentheses), per your environment
+#   - Areas from selected cell only (non-recursive)
 #   - Time per group: seconds = min_dose[µC/cm²] * area[mm²] / current[nA] * 10
 #   - Cost in Kr using Rate [Kr/hr]
 # ==========================================================
@@ -32,24 +33,29 @@
 import pya
 import math
 
-FREQ_MAX_HZ = 200_000_000.0   # 200 MHz (JEOL-9500 limit)  [Excel sheet]
-MIN_SHOT_NS = 5.0             # 5 ns minimum shot time     [Excel sheet]
+FREQ_MAX_HZ = 200_000_000.0   # 200 MHz (JEOL-9500 limit)
+MIN_SHOT_NS = 5.0             # 5 ns minimum shot time
 
 class calcWriteTimeEBL(pya.QDialog):
     """
-    JEOL-9500 write time estimator with Single/Double current modes,
-    per-group beam pitch, compact layer selection + right-side info panel,
-    and a status/advice banner when machine limits are violated.
+    JEOL-9500 write time estimator with:
+      - Cell selector
+      - Ordered layers (Layer/Datatype numeric sort)
+      - Single/Double current modes and per-group beam pitch
+      - Constraint banners and cost estimate in Kr
     """
 
     def __init__(self, parent=None):
         super(calcWriteTimeEBL, self).__init__(parent)
-        self._layer_map = {}  # display string -&gt; pya.LayerInfo
+        self._layer_map = {}            # display string -&gt; pya.LayerInfo
+        self._cell_map = {}             # display name -&gt; cell index
+        self._selected_cell_index = None
 
         self.initGUI()
         self.initLayout()
         self.initConnection()
-        self.populateLayerLists()
+        self.populateCells()            # sets cell combo and current cell
+        self.populateLayerLists()       # fills layer lists for current layout
         self.updateCurrentModeVisibility()
 
     # ---------------------------
@@ -57,12 +63,18 @@ class calcWriteTimeEBL(pya.QDialog):
     # ---------------------------
     def initGUI(self):
         self.setWindowTitle("Write Time Calculator: JEOL-9500")
-        self.resize(860, 940)
+        self.resize(880, 980)
+
+        # --- Cell selector ---
+        self.labelCellTitle = pya.QLabel("Cell:", self)
+        self.cellCombo = pya.QComboBox(self)
+        self.cellCombo.setMinimumWidth(280)
+        self.labelCellName = pya.QLabel("", self)  # displays active/selected cell name next to the combo
 
         # Instruction
         self.labelInstruction = pya.QLabel(
-            "This tool estimates JEOL-9500 beam-on write time with machine constraints.\n"
-            "Use Single or Double current, choose layers, set Base dose, Minimum modulation, and per-group Beam pitch.",
+            "Estimate JEOL-9500 beam-on write time with machine constraints.\n"
+            "Select Cell, choose Single or Double current, pick layers, set Base dose, Minimum modulation, and per-group Beam pitch.",
             self
         )
 
@@ -99,11 +111,11 @@ class calcWriteTimeEBL(pya.QDialog):
 
         self.labelLayers1 = pya.QLabel("Layers (Group 1):", self)
         self.layersList1 = pya.QListWidget(self)
-        self.layersList1.setSelectionMode(pya.QAbstractItemView.MultiSelection)
+        self.layersList1.setSelectionMode(pya.QAbstractItemView.MultiSelection)  # mouse-only multi-select
         self.layersList1.setMinimumHeight(120)
         self.layersList1.setMaximumWidth(280)
 
-        # Group 1: info grid (right)
+        # Group 1 info panel (right)
         self.labelMinDose1 = pya.QLabel("Minimum dose 1 [µC/cm²]:", self)
         self.labelMinDose1Value = pya.QLabel("", self)
         self.labelFreq1 = pya.QLabel("Scanner frequency 1 [MHz]:", self)
@@ -114,7 +126,7 @@ class calcWriteTimeEBL(pya.QDialog):
         self.labelIth1Value = pya.QLabel("", self)
         self.noteIth1 = pya.QLabel("&lt;i&gt;Threshold current: maximum allowed current at this dose and beam shot.&lt;/i&gt;", self)
 
-        # Group 1: status/advice banner
+        # Group 1 status/advice
         self.status1 = pya.QLabel("", self)
         self.status1.setWordWrap(True)
         self.status1.setStyleSheet("QLabel { padding:6px; border-radius:4px; }")
@@ -188,7 +200,7 @@ class calcWriteTimeEBL(pya.QDialog):
         wrapper = pya.QWidget(self)
         h = pya.QHBoxLayout(wrapper)
 
-        # Left column: layers
+        # Left: layers
         left_col = pya.QVBoxLayout()
         if not is_group2:
             left_col.addWidget(self.labelLayers1)
@@ -197,7 +209,7 @@ class calcWriteTimeEBL(pya.QDialog):
             left_col.addWidget(self.labelLayers2)
             left_col.addWidget(self.layersList2)
 
-        # Right column: info grid + status + threshold note
+        # Right: info grid + status + note
         right_col = pya.QVBoxLayout()
         grid = pya.QGridLayout()
 
@@ -228,6 +240,14 @@ class calcWriteTimeEBL(pya.QDialog):
         return wrapper
 
     def initLayout(self):
+        # --- Cell row ---
+        hlCell = pya.QHBoxLayout()
+        hlCell.addWidget(self.labelCellTitle)
+        hlCell.addWidget(self.cellCombo)
+        hlCell.addSpacing(12)
+        hlCell.addWidget(self.labelCellName)
+        hlCell.addStretch()
+
         # Mode row
         hlMode = pya.QHBoxLayout()
         hlMode.addWidget(self.rbSingle)
@@ -305,6 +325,7 @@ class calcWriteTimeEBL(pya.QDialog):
 
         # Main layout
         v = pya.QVBoxLayout(self)
+        v.addLayout(hlCell)
         v.addWidget(self.labelInstruction)
         v.addLayout(hlMode)
         v.addLayout(hlMinMod)
@@ -324,6 +345,9 @@ class calcWriteTimeEBL(pya.QDialog):
         self.setLayout(v)
 
     def initConnection(self):
+        # Cell selection
+        self.cellCombo.currentIndexChanged.connect(self.onCellChanged)
+
         # Mode toggle
         self.rbSingle.toggled.connect(self.updateCurrentModeVisibility)
         self.rbDouble.toggled.connect(self.updateCurrentModeVisibility)
@@ -386,14 +410,24 @@ class calcWriteTimeEBL(pya.QDialog):
         return layers
 
     # Coercion handlers
-    def get_leMinMod(self):         self._get_float(self.leMinMod,       0.0,  0.0, 100.0)
-    def get_leCurrent1(self):       self._get_float(self.leCurrent1,     6.0,  0.01, 100.0)
-    def get_leDose1(self):          self._get_float(self.leDose1,        2000.0, 1.0, None)
-    def get_lePitchUnits1(self):    self._get_float(self.lePitchUnits1,  4.0,  1.0, None)
-    def get_leCurrent2(self):       self._get_float(self.leCurrent2,     4.0,  0.01, 100.0)
-    def get_leDose2(self):          self._get_float(self.leDose2,        2000.0, 1.0, None)
-    def get_lePitchUnits2(self):    self._get_float(self.lePitchUnits2,  4.0,  1.0, None)
-    def get_leRateKr(self):         self._get_float(self.leRateKr,       600.0, 1.0, None)
+    def get_leMinMod(self):         self._get_float(self.leMinMod,       0.0,   0.0, 100.0)
+    def get_leCurrent1(self):       self._get_float(self.leCurrent1,     6.0,   0.01, 100.0)
+    def get_leDose1(self):          self._get_float(self.leDose1,        2000.0, 1.0,  None)
+    def get_lePitchUnits1(self):    self._get_float(self.lePitchUnits1,  4.0,   1.0,  None)
+    def get_leCurrent2(self):       self._get_float(self.leCurrent2,     4.0,   0.01, 100.0)
+    def get_leDose2(self):          self._get_float(self.leDose2,        2000.0, 1.0,  None)
+    def get_lePitchUnits2(self):    self._get_float(self.lePitchUnits2,  4.0,   1.0,  None)
+    def get_leRateKr(self):         self._get_float(self.leRateKr,       600.0, 1.0,  None)
+
+    def _set_status_banner(self, label_widget, ok):
+        if ok:
+            label_widget.setStyleSheet(
+                "QLabel { background:#e8f7e8; color:#1e4620; border:1px solid #b7e1b7; padding:6px; border-radius:4px; }"
+            )
+        else:
+            label_widget.setStyleSheet(
+                "QLabel { background:#ffecec; color:#5f2120; border:1px solid #f5c6c6; padding:6px; border-radius:4px; }"
+            )
 
     def updateCurrentModeVisibility(self):
         is_double = self.rbDouble.isChecked()
@@ -410,13 +444,92 @@ class calcWriteTimeEBL(pya.QDialog):
         # Clear status2 when hidden
         if not is_double:
             self.status2.setText("")
-            self.status2.setStyleSheet("QLabel { padding:6px; border-radius:4px; }")
+            self._set_status_banner(self.status2, True)
+
+    # ---------------------------
+    # Cell &amp; Layer population
+    # ---------------------------
+    def populateCells(self):
+        """
+        Fill the cell combo with all cells in the active layout; remember mapping.
+        Default selection is the active cell of the view.
+        """
+        self._cell_map = {}
+        self.cellCombo.clear()
+
+        view = pya.LayoutView.current()
+        if not view:
+            self.labelCellName.setText("(no view)")
+            return
+
+        try:
+            cv = view.active_cellview()
+            layout = cv.layout()
+            active_cell = cv.cell
+        except Exception:
+            self.labelCellName.setText("(no active cell)")
+            return
+
+        if not layout:
+            self.labelCellName.setText("(no layout)")
+            return
+
+        # Build list of cells (index -&gt; name); sort by case-insensitive name
+        cells = []
+        for ci in range(layout.cells()):
+            c = layout.cell(ci)
+            if c is None:
+                continue
+            name = c.name
+            if name is None or name == "":
+                name = f"(unnamed_{ci})"
+            cells.append((name, ci))
+
+        # Sort by name for easier picking
+        cells.sort(key=lambda t: t[0].lower())
+
+        # Fill combo and map
+        active_index_in_combo = 0
+        for idx, (nm, ci) in enumerate(cells):
+            self.cellCombo.addItem(nm)
+            self._cell_map[nm] = ci
+            if active_cell and ci == active_cell.cell_index():
+                active_index_in_combo = idx
+
+        # Select active cell
+        self.cellCombo.setCurrentIndex(active_index_in_combo)
+        # Track currently selected cell index
+        sel_name = self.cellCombo.currentText
+        self._selected_cell_index = self._cell_map.get(sel_name, active_cell.cell_index() if active_cell else None)
+        self.labelCellName.setText(f"Selected: {sel_name}")
+
+    def onCellChanged(self, *_):
+        """
+        Update selected cell index and refresh layer lists.
+        """
+        sel_name = self.cellCombo.currentText
+        if sel_name in self._cell_map:
+            self._selected_cell_index = self._cell_map[sel_name]
+            self.labelCellName.setText(f"Selected: {sel_name}")
+        else:
+            self._selected_cell_index = None
+            self.labelCellName.setText("Selected: (none)")
+        # Re-populate layers (order kept numeric)
+        self.populateLayerLists()
 
     def populateLayerLists(self):
+        """
+        Populate the two layer lists from the selected cell's layout,
+        build display-&gt;LayerInfo map, and ensure numeric ordering by (layer, datatype).
+        """
         self._layer_map = {}
+        self.layersList1.clear()
+        self.layersList2.clear()
+
         view = pya.LayoutView.current()
         if not view:
             return
+
         try:
             cv = view.active_cellview()
             layout = cv.layout()
@@ -424,30 +537,37 @@ class calcWriteTimeEBL(pya.QDialog):
             return
         if not layout:
             return
-        try:
-            layers = list(layout.layer_infos())
-        except Exception:
-            layers = []
-        items = []
-        for li in layers:
-            try:
-                s = li.to_s()
-            except Exception:
-                lyr = getattr(li, "layer", "?")
-                dt = getattr(li, "datatype", "?")
-                s = f"{lyr}/{dt}"
-            items.append((s, li))
-        items.sort(key=lambda x: x[0])
 
-        self.layersList1.clear()
-        self.layersList2.clear()
-        for s, li in items:
+        # Acquire all layer infos from layout
+        try:
+            layer_infos = list(layout.layer_infos())
+        except Exception:
+            layer_infos = []
+
+        # Build (L, D, string, LayerInfo) and sort numerically by (L, D)
+        items = []
+        for li in layer_infos:
+            try:
+                L = li.layer
+                D = li.datatype
+            except Exception:
+                continue
+            try:
+                s = li.to_s()   # e.g., "10/0"
+            except Exception:
+                s = f"{L}/{D}"
+            items.append((L, D, s, li))
+
+        items.sort(key=lambda x: (x[0], x[1]))  # numeric order by (Layer, Datatype)
+
+        # Fill both lists and map
+        for L, D, s, li in items:
             self.layersList1.addItem(s)
             self.layersList2.addItem(s)
             self._layer_map[s] = li
 
     # ---------------------------
-    # JEOL-9500 math helpers (from Excel)
+    # JEOL-9500 math helpers
     # ---------------------------
     def _beam_pitch_nm(self, units_025nm):
         # Beam pitch (nm) = units × 0.25 nm
@@ -475,19 +595,6 @@ class calcWriteTimeEBL(pya.QDialog):
         # Highest current with f &lt;= 200 MHz: I_thr = f_max * q_shot
         return FREQ_MAX_HZ * q_shot_C * 1e9
 
-    def _set_status_banner(self, label_widget, ok):
-        """
-        Colors the status banner red (action needed) or green (OK).
-        """
-        if ok:
-            label_widget.setStyleSheet(
-                "QLabel { background:#e8f7e8; color:#1e4620; border:1px solid #b7e1b7; padding:6px; border-radius:4px; }"
-            )
-        else:
-            label_widget.setStyleSheet(
-                "QLabel { background:#ffecec; color:#5f2120; border:1px solid #f5c6c6; padding:6px; border-radius:4px; }"
-            )
-
     # ---------------------------
     # Core calculation
     # ---------------------------
@@ -500,13 +607,21 @@ class calcWriteTimeEBL(pya.QDialog):
         try:
             cv = view.active_cellview()
             layout = cv.layout()
-            cell = cv.cell
         except Exception:
-            pya.QMessageBox.warning(self, "No Active Cell", "Active cell not found.")
+            pya.QMessageBox.warning(self, "No Active Layout", "Active layout not found.")
             return
 
-        if layout is None or cell is None:
-            pya.QMessageBox.warning(self, "No Active Cell", "Active cell not found.")
+        if layout is None:
+            pya.QMessageBox.warning(self, "No Active Layout", "Active layout not found.")
+            return
+
+        # Resolve selected cell by index
+        if self._selected_cell_index is None:
+            pya.QMessageBox.warning(self, "No Cell Selected", "Please select a valid cell.")
+            return
+        cell = layout.cell(self._selected_cell_index)
+        if cell is None:
+            pya.QMessageBox.warning(self, "Invalid Cell", "Selected cell is not available.")
             return
 
         # Read globals
@@ -517,7 +632,7 @@ class calcWriteTimeEBL(pya.QDialog):
         current1 = self._get_float(self.leCurrent1, 6.0, 0.01, 100.0)
         base_dose1 = self._get_float(self.leDose1, 2000.0, 1.0, None)
         pitch_units1 = self._get_float(self.lePitchUnits1, 4.0, 1.0, None)
-        pitch_nm1 = self._beam_pitch_nm(pitch_units1)  # units × 0.25 nm (Excel)
+        pitch_nm1 = self._beam_pitch_nm(pitch_units1)  # units × 0.25 nm
         self.labelPitchNm1Value.setText(f"{pitch_nm1:g}")
         area_shot1_cm2 = self._area_per_shot_cm2(pitch_nm1)
         min_dose1 = self._min_dose(base_dose1, min_mod)
@@ -545,7 +660,7 @@ class calcWriteTimeEBL(pya.QDialog):
             pitch_nm2 = 0.0; area_shot2_cm2 = 0.0; min_dose2 = 0.0
             q_shot2_C = 0.0; f2_Hz = 0.0; shot2_ns = 0.0; ith2_nA = 0.0
 
-        # ----- Compute selected areas (mm²) -----
+        # ----- Compute selected areas (mm²) from the selected cell -----
         def total_area_mm2_for_layers(layer_infos):
             if not layer_infos:
                 return 0.0
@@ -556,7 +671,7 @@ class calcWriteTimeEBL(pya.QDialog):
                 except Exception:
                     continue
                 try:
-                    shapes = layout.begin_shapes(cell, layer_index)  # non-recursive
+                    shapes = layout.begin_shapes(cell, layer_index)  # non-recursive on selected cell
                 except Exception:
                     continue
                 while not shapes.at_end():
@@ -603,7 +718,6 @@ class calcWriteTimeEBL(pya.QDialog):
             self._set_status_banner(self.status2, True)
 
         # ----- Status/advice banners -----
-        # Violation if f &gt; 200 MHz or shot &lt; 5 ns (from your JEOL sheet)  [1](https://alumni-my.sharepoint.com/personal/nfv144_ku_dk/_layouts/15/Doc.aspx?sourcedoc=%7B3E953E31-2F57-44B0-8921-82A44D58A7BD%7D&amp;file=WritingTimeEstimator.xlsx&amp;action=default&amp;mobileredirect=true)
         def advice_text(group_name):
             return (f"&lt;b&gt;{group_name} — Action needed:&lt;/b&gt; Scanner frequency exceeds 200&amp;nbsp;MHz or shot time is below 5&amp;nbsp;ns.&lt;br&gt;"
                     f"Adjust parameters: &lt;b&gt;increase beam pitch&lt;/b&gt; or &lt;b&gt;increase dose&lt;/b&gt;, or &lt;b&gt;reduce current&lt;/b&gt;.&lt;br&gt;"
