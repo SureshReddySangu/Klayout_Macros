@@ -1,0 +1,674 @@
+<?xml version="1.0" encoding="utf-8"?>
+<klayout-macro>
+ <description/>
+ <version/>
+ <category>pymacros</category>
+ <prolog/>
+ <epilog/>
+ <doc/>
+ <autorun>false</autorun>
+ <autorun-early>false</autorun-early>
+ <priority>0</priority>
+ <shortcut/>
+ <show-in-menu>false</show-in-menu>
+ <group-name/>
+ <menu-path/>
+ <interpreter>python</interpreter>
+ <dsl-interpreter-name/>
+ <text># ==========================================================
+# EBL Write Time Calculator (JEOL-9500 Excel-Based Estimator)
+# Notes:
+#   - Per your environment: all QLineEdit reads use `.text` (NO parentheses).
+#   - Allows multi-layer selection in both Single and Double current modes.
+#   - JEOL-9500 constraints applied:
+#       * Scanner frequency f = I / q_shot  (must be &lt;= 200 MHz)
+#       * Shot time = 1/f  (must be &gt;= 5 ns)
+#       * If over the limit, effective current is clamped to the threshold current
+#   - Minimum dose = BaseDose * (1 - MinMod%).
+#   - Time formula (same charge/current basis as original):
+#       seconds = min_dose[µC/cm²] * area[mm²] / current[nA] * 10
+#   - Cost computed in Kr using Rate [Kr/hr].
+#   - KLayout `pya` Qt wrappers only.
+# ==========================================================
+
+import pya
+import math
+
+FREQ_MAX_HZ = 200_000_000.0   # 200 MHz limit for JEOL-9500
+MIN_SHOT_NS = 5.0             # shot time must be &gt;= 5 ns (same limit as f &lt;= 200 MHz)
+
+class calcWriteTimeEBL(pya.QDialog):
+    """
+    JEOL-9500 write time estimator with Single/Double current modes and multi-layer selection.
+    """
+
+    def __init__(self, parent=None):
+        super(calcWriteTimeEBL, self).__init__(parent)
+        self._layer_map = {}  # maps display string -&gt; pya.LayerInfo
+
+        # Initialize GUI, layout, connections, and layer lists
+        self.initGUI()
+        self.initLayout()
+        self.initConnection()
+        self.populateLayerLists()
+        self.updateCurrentModeVisibility()
+
+    # ---------------------------
+    # GUI
+    # ---------------------------
+    def initGUI(self):
+        # Window
+        self.setWindowTitle("Write Time Calculator: JEOL-9500")
+        self.resize(760, 900)
+
+        # Instruction
+        self.labelInstruction = pya.QLabel(
+            "This tool estimates JEOL-9500 write time using your machine constraints.\n"
+            "Select Single or Double current, choose layers, set Base dose, Minimum modulation, and Beam pitch.",
+            self
+        )
+
+        # --- Mode selection (single/double) ---
+        self.rbSingle = pya.QRadioButton("Single current", self)
+        self.rbDouble = pya.QRadioButton("Double currents", self)
+        self.rbSingle.setChecked(True)
+
+        # --- Global inputs (apply to both groups) ---
+        self.labelMinMod = pya.QLabel("Min. Modulation [%]: ", self)
+        self.leMinMod = pya.QLineEdit("0", self)
+        self.leMinMod.setFixedWidth(120)
+        self.leMinMod.setValidator(pya.QRegExpValidator(pya.QRegExp(r"[0-9\.e\-]*"), self))
+        self.leMinMod.setToolTip("Lowest modulation (e.g., shot rank 0). Use 0% if only positive/no modulation.")
+
+        self.labelBeamPitchUnits = pya.QLabel("Beam pitch [units of 0.25 nm]: ", self)
+        self.leBeamPitchUnits = pya.QLineEdit("4", self)  # 4 * 0.25 nm = 1 nm
+        self.leBeamPitchUnits.setFixedWidth(120)
+        self.leBeamPitchUnits.setValidator(pya.QRegExpValidator(pya.QRegExp(r"[0-9\.e\-]*"), self))
+        self.leBeamPitchUnits.setToolTip("Value used in SHOT A,n; units of 0.25 nm. Example: 4 =&gt; 1.0 nm.")
+
+        # Derived beam pitch output
+        self.labelBeamPitchNm = pya.QLabel("Beam pitch [nm]:", self)
+        self.labelBeamPitchNmValue = pya.QLabel("", self)
+
+        # --- Group 1: Current/Dose/Layers ---
+        self.group1Title = pya.QLabel("&lt;b&gt;Group 1&lt;/b&gt;", self)
+
+        self.labelCurrent1 = pya.QLabel("Current 1 [nA]: ", self)
+        self.leCurrent1 = pya.QLineEdit("6.0", self)
+        self.leCurrent1.setFixedWidth(120)
+        self.leCurrent1.setValidator(pya.QRegExpValidator(pya.QRegExp(r"[0-9\.e\-]*"), self))
+
+        self.labelDose1 = pya.QLabel("Base dose 1 [µC/cm²]: ", self)
+        self.leDose1 = pya.QLineEdit("2000", self)
+        self.leDose1.setFixedWidth(120)
+        self.leDose1.setValidator(pya.QRegExpValidator(pya.QRegExp(r"[0-9\.e\-]*"), self))
+
+        self.labelLayers1 = pya.QLabel("Layers (Group 1):", self)
+        self.layersList1 = pya.QListWidget(self)
+        # Mouse-only multi-select (no need for Ctrl/Shift)
+        self.layersList1.setSelectionMode(pya.QAbstractItemView.MultiSelection)
+        self.layersList1.setMinimumHeight(160)
+
+        # Group 1 outputs (per the Excel logic)
+        self.labelMinDose1 = pya.QLabel("Minimum dose 1 [µC/cm²]:", self)
+        self.labelMinDose1Value = pya.QLabel("", self)
+
+        self.labelFreq1 = pya.QLabel("Scanner frequency 1 [MHz]:", self)
+        self.labelFreq1Value = pya.QLabel("", self)
+
+        self.labelShot1 = pya.QLabel("Shot time 1 [ns]:", self)
+        self.labelShot1Value = pya.QLabel("", self)
+
+        self.labelIth1 = pya.QLabel("Threshold current 1 [nA]:", self)
+        self.labelIth1Value = pya.QLabel("", self)
+
+        # --- Group 2: Current/Dose/Layers (visible only in double mode) ---
+        self.group2Title = pya.QLabel("&lt;b&gt;Group 2&lt;/b&gt;", self)
+
+        self.labelCurrent2 = pya.QLabel("Current 2 [nA]: ", self)
+        self.leCurrent2 = pya.QLineEdit("4.0", self)
+        self.leCurrent2.setFixedWidth(120)
+        self.leCurrent2.setValidator(pya.QRegExpValidator(pya.QRegExp(r"[0-9\.e\-]*"), self))
+
+        self.labelDose2 = pya.QLabel("Base dose 2 [µC/cm²]: ", self)
+        self.leDose2 = pya.QLineEdit("2000", self)
+        self.leDose2.setFixedWidth(120)
+        self.leDose2.setValidator(pya.QRegExpValidator(pya.QRegExp(r"[0-9\.e\-]*"), self))
+
+        self.labelLayers2 = pya.QLabel("Layers (Group 2):", self)
+        self.layersList2 = pya.QListWidget(self)
+        self.layersList2.setSelectionMode(pya.QAbstractItemView.MultiSelection)
+        self.layersList2.setMinimumHeight(160)
+
+        # Group 2 outputs
+        self.labelMinDose2 = pya.QLabel("Minimum dose 2 [µC/cm²]:", self)
+        self.labelMinDose2Value = pya.QLabel("", self)
+
+        self.labelFreq2 = pya.QLabel("Scanner frequency 2 [MHz]:", self)
+        self.labelFreq2Value = pya.QLabel("", self)
+
+        self.labelShot2 = pya.QLabel("Shot time 2 [ns]:", self)
+        self.labelShot2Value = pya.QLabel("", self)
+
+        self.labelIth2 = pya.QLabel("Threshold current 2 [nA]:", self)
+        self.labelIth2Value = pya.QLabel("", self)
+
+        # --- Rate in Kr/hr &amp; action ---
+        self.labelRateKr = pya.QLabel("Rate [Kr/hr]: ", self)
+        self.leRateKr = pya.QLineEdit("600", self)
+        self.leRateKr.setFixedWidth(120)
+        self.leRateKr.setValidator(pya.QRegExpValidator(pya.QRegExp(r"[0-9\.e\-]*"), self))
+
+        self.bCalc = pya.QPushButton(self)
+        self.bCalc.setText("Estimate Write Time")
+
+        # --- Results (combined) ---
+        self.labelTotalTime = pya.QLabel("", self)
+        self.labelTotalTimeValue = pya.QLabel("", self)
+
+        self.labelCost = pya.QLabel("", self)
+        self.labelCostValue = pya.QLabel("", self)
+
+        self.labelLayer = pya.QLabel("", self)
+        self.labelArea = pya.QLabel("", self)
+        self.labelTime = pya.QLabel("", self)
+
+        mono = pya.QFont("Courier New")
+        self.labelLayer.setFont(mono)
+        self.labelArea.setFont(mono)
+        self.labelTime.setFont(mono)
+
+    def initLayout(self):
+        # Mode row
+        hlMode = pya.QHBoxLayout()
+        hlMode.addWidget(self.rbSingle)
+        hlMode.addWidget(self.rbDouble)
+        hlMode.addStretch()
+
+        # Global inputs: MinMod, Beam pitch units
+        hlMinMod = pya.QHBoxLayout()
+        hlMinMod.addWidget(self.labelMinMod)
+        hlMinMod.addWidget(self.leMinMod)
+        hlMinMod.addStretch()
+
+        hlPitchUnits = pya.QHBoxLayout()
+        hlPitchUnits.addWidget(self.labelBeamPitchUnits)
+        hlPitchUnits.addWidget(self.leBeamPitchUnits)
+        hlPitchUnits.addStretch()
+
+        hlPitchNm = pya.QHBoxLayout()
+        hlPitchNm.addWidget(self.labelBeamPitchNm)
+        hlPitchNm.addStretch()
+        hlPitchNm.addWidget(self.labelBeamPitchNmValue)
+
+        # Group 1 rows
+        hlCurr1 = pya.QHBoxLayout()
+        hlCurr1.addWidget(self.labelCurrent1)
+        hlCurr1.addWidget(self.leCurrent1)
+        hlCurr1.addSpacing(16)
+        hlCurr1.addWidget(self.labelDose1)
+        hlCurr1.addWidget(self.leDose1)
+        hlCurr1.addStretch()
+
+        hlMinDose1 = pya.QHBoxLayout()
+        hlMinDose1.addWidget(self.labelMinDose1)
+        hlMinDose1.addStretch()
+        hlMinDose1.addWidget(self.labelMinDose1Value)
+
+        hlFreq1 = pya.QHBoxLayout()
+        hlFreq1.addWidget(self.labelFreq1)
+        hlFreq1.addStretch()
+        hlFreq1.addWidget(self.labelFreq1Value)
+
+        hlShot1 = pya.QHBoxLayout()
+        hlShot1.addWidget(self.labelShot1)
+        hlShot1.addStretch()
+        hlShot1.addWidget(self.labelShot1Value)
+
+        hlIth1 = pya.QHBoxLayout()
+        hlIth1.addWidget(self.labelIth1)
+        hlIth1.addStretch()
+        hlIth1.addWidget(self.labelIth1Value)
+
+        # Group 2 rows
+        hlCurr2 = pya.QHBoxLayout()
+        hlCurr2.addWidget(self.labelCurrent2)
+        hlCurr2.addWidget(self.leCurrent2)
+        hlCurr2.addSpacing(16)
+        hlCurr2.addWidget(self.labelDose2)
+        hlCurr2.addWidget(self.leDose2)
+        hlCurr2.addStretch()
+
+        hlMinDose2 = pya.QHBoxLayout()
+        hlMinDose2.addWidget(self.labelMinDose2)
+        hlMinDose2.addStretch()
+        hlMinDose2.addWidget(self.labelMinDose2Value)
+
+        hlFreq2 = pya.QHBoxLayout()
+        hlFreq2.addWidget(self.labelFreq2)
+        hlFreq2.addStretch()
+        hlFreq2.addWidget(self.labelFreq2Value)
+
+        hlShot2 = pya.QHBoxLayout()
+        hlShot2.addWidget(self.labelShot2)
+        hlShot2.addStretch()
+        hlShot2.addWidget(self.labelShot2Value)
+
+        hlIth2 = pya.QHBoxLayout()
+        hlIth2.addWidget(self.labelIth2)
+        hlIth2.addStretch()
+        hlIth2.addWidget(self.labelIth2Value)
+
+        # Rate
+        hlRate = pya.QHBoxLayout()
+        hlRate.addWidget(self.labelRateKr)
+        hlRate.addStretch()
+        hlRate.addWidget(self.leRateKr)
+
+        # Totals/cost rows
+        hlTotalTime = pya.QHBoxLayout()
+        hlTotalTime.addWidget(self.labelTotalTime)
+        hlTotalTime.addStretch()
+        hlTotalTime.addWidget(self.labelTotalTimeValue)
+
+        hlCost = pya.QHBoxLayout()
+        hlCost.addWidget(self.labelCost)
+        hlCost.addStretch()
+        hlCost.addWidget(self.labelCostValue)
+
+        # Results row (three columns as labels)
+        hlResult = pya.QHBoxLayout()
+        hlResult.addWidget(self.labelLayer)
+        hlResult.addStretch()
+        hlResult.addWidget(self.labelArea)
+        hlResult.addStretch()
+        hlResult.addWidget(self.labelTime)
+
+        # Main vertical layout
+        v = pya.QVBoxLayout(self)
+        v.addWidget(self.labelInstruction)
+        v.addLayout(hlMode)
+        v.addLayout(hlMinMod)
+        v.addLayout(hlPitchUnits)
+        v.addLayout(hlPitchNm)
+
+        # Group 1
+        v.addWidget(self.group1Title)
+        v.addLayout(hlCurr1)
+        v.addWidget(self.labelLayers1)
+        v.addWidget(self.layersList1)
+        v.addLayout(hlMinDose1)
+        v.addLayout(hlFreq1)
+        v.addLayout(hlShot1)
+        v.addLayout(hlIth1)
+
+        # Group 2 (visibility toggled)
+        v.addWidget(self.group2Title)
+        v.addLayout(hlCurr2)
+        v.addWidget(self.labelLayers2)
+        v.addWidget(self.layersList2)
+        v.addLayout(hlMinDose2)
+        v.addLayout(hlFreq2)
+        v.addLayout(hlShot2)
+        v.addLayout(hlIth2)
+
+        # Rate, button, and combined results
+        v.addLayout(hlRate)
+        v.addWidget(self.bCalc)
+        v.addLayout(hlTotalTime)
+        v.addLayout(hlCost)
+        v.addLayout(hlResult)
+
+        self.setLayout(v)
+
+    def initConnection(self):
+        # Mode toggle
+        self.rbSingle.toggled.connect(self.updateCurrentModeVisibility)
+        self.rbDouble.toggled.connect(self.updateCurrentModeVisibility)
+
+        # Sanity/coercion on edits
+        self.leMinMod.editingFinished.connect(self.get_leMinMod)
+        self.leBeamPitchUnits.editingFinished.connect(self.get_leBeamPitchUnits)
+
+        self.leCurrent1.editingFinished.connect(self.get_leCurrent1)
+        self.leDose1.editingFinished.connect(self.get_leDose1)
+
+        self.leCurrent2.editingFinished.connect(self.get_leCurrent2)
+        self.leDose2.editingFinished.connect(self.get_leDose2)
+
+        self.leRateKr.editingFinished.connect(self.get_leRateKr)
+
+        # Calculate
+        self.bCalc.clicked.connect(self.getWriteTime)
+
+    # ---------------------------
+    # Helper utils
+    # ---------------------------
+    def getSecondsToTime(self, seconds):
+        """
+        Converts seconds (float) to HH:MM:SS string
+        """
+        try:
+            s = int(round(max(0.0, float(seconds))))
+        except Exception:
+            s = 0
+        hours = s // 3600
+        s = s % 3600
+        minutes = s // 60
+        seconds = s % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _get_float(self, le_widget, default, min_val=None, max_val=None):
+        """
+        Read a float from a QLineEdit using .text (no parentheses),
+        clamp to [min_val, max_val] if given, mirror back into the line edit.
+        """
+        try:
+            val = float(le_widget.text)
+        except Exception:
+            val = default
+        if (min_val is not None) and (val &lt; min_val):
+            val = min_val
+        if (max_val is not None) and (val &gt; max_val):
+            val = max_val
+        le_widget.setText(str(val))
+        return val
+
+    def _selected_layers(self, list_widget):
+        """
+        Return list of LayerInfo objects selected in the given QListWidget,
+        using the _layer_map populated from populateLayerLists().
+        """
+        layers = []
+        try:
+            items = list_widget.selectedItems()
+        except Exception:
+            items = []
+        for it in items:
+            try:
+                label = it.text  # NOTE: .text (no parentheses)
+            except Exception:
+                continue
+            if label in self._layer_map:
+                layers.append(self._layer_map[label])
+        return layers
+
+    # Individual coercion handlers
+    def get_leMinMod(self):          self._get_float(self.leMinMod, 0.0, 0.0, 100.0)
+    def get_leBeamPitchUnits(self):  self._get_float(self.leBeamPitchUnits, 4.0, 1.0, None)
+
+    def get_leCurrent1(self):        self._get_float(self.leCurrent1, 6.0, 0.01, 100.0)
+    def get_leDose1(self):           self._get_float(self.leDose1,    2000.0, 1.0, None)
+
+    def get_leCurrent2(self):        self._get_float(self.leCurrent2, 4.0, 0.01, 100.0)
+    def get_leDose2(self):           self._get_float(self.leDose2,    2000.0, 1.0, None)
+
+    def get_leRateKr(self):          self._get_float(self.leRateKr,   600.0, 1.0, None)
+
+    def updateCurrentModeVisibility(self):
+        """
+        Toggle visibility of Group 2 fields based on radio selection.
+        """
+        is_double = self.rbDouble.isChecked()
+        self.group2Title.setVisible(is_double)
+        self.labelCurrent2.setVisible(is_double)
+        self.leCurrent2.setVisible(is_double)
+        self.labelDose2.setVisible(is_double)
+        self.leDose2.setVisible(is_double)
+        self.labelLayers2.setVisible(is_double)
+        self.layersList2.setVisible(is_double)
+        self.labelMinDose2.setVisible(is_double)
+        self.labelMinDose2Value.setVisible(is_double)
+        self.labelFreq2.setVisible(is_double)
+        self.labelFreq2Value.setVisible(is_double)
+        self.labelShot2.setVisible(is_double)
+        self.labelShot2Value.setVisible(is_double)
+        self.labelIth2.setVisible(is_double)
+        self.labelIth2Value.setVisible(is_double)
+
+    def populateLayerLists(self):
+        """
+        Populate the two layer lists from the active layout, build display-&gt;LayerInfo map.
+        """
+        self._layer_map = {}
+        view = pya.LayoutView.current()
+        if not view:
+            return
+        try:
+            cv = view.active_cellview()
+            layout = cv.layout()
+        except Exception:
+            return
+        if not layout:
+            return
+
+        try:
+            layers = list(layout.layer_infos())
+        except Exception:
+            layers = []
+
+        items = []
+        for li in layers:
+            try:
+                s = li.to_s()
+            except Exception:
+                lyr = getattr(li, "layer", "?")
+                dt = getattr(li, "datatype", "?")
+                s = f"{lyr}/{dt}"
+            items.append((s, li))
+        items.sort(key=lambda x: x[0])
+
+        self.layersList1.clear()
+        self.layersList2.clear()
+        for s, li in items:
+            self.layersList1.addItem(s)
+            self.layersList2.addItem(s)
+            self._layer_map[s] = li
+
+    # ---------------------------
+    # JEOL-9500 math helpers (Excel-based)
+    # ---------------------------
+    def _beam_pitch_nm(self, units_025nm):
+        """
+        Converts beam pitch units (of 0.25 nm) to nanometers.
+        """
+        return units_025nm * 0.25
+
+    def _area_per_shot_cm2(self, pitch_nm):
+        """
+        Area of one shot in cm^2 given pitch in nm.
+        1 nm = 1e-7 cm.
+        """
+        pitch_cm = pitch_nm * 1e-7
+        return pitch_cm * pitch_cm
+
+    def _min_dose(self, base_dose_uc_cm2, min_mod_percent):
+        """
+        Minimum dose from base dose and minimum modulation (%).
+        """
+        return max(0.0, base_dose_uc_cm2 * (1.0 - min_mod_percent / 100.0))
+
+    def _charge_per_shot_C(self, min_dose_uc_cm2, area_shot_cm2):
+        """
+        Charge per shot (C) = min_dose[µC/cm²] * 1e-6 * area_shot[cm²]
+        """
+        return min_dose_uc_cm2 * 1e-6 * area_shot_cm2
+
+    def _scanner_freq_Hz(self, current_nA, q_shot_C):
+        """
+        Shot frequency (Hz) = I / q_shot = (current[nA]*1e-9) / q_shot[C]
+        """
+        if q_shot_C &lt;= 0.0:
+            return 0.0
+        return (current_nA * 1e-9) / q_shot_C
+
+    def _threshold_current_nA(self, q_shot_C):
+        """
+        Highest current that keeps f &lt;= 200 MHz:
+            I_thr = f_max * q_shot
+        """
+        return FREQ_MAX_HZ * q_shot_C * 1e9
+
+    # ---------------------------
+    # Core calculation
+    # ---------------------------
+    def getWriteTime(self):
+        """
+        Calculates the write time and displays it using the JEOL-9500 Excel method.
+        """
+        # Acquire active view/cell
+        view = pya.LayoutView.current()
+        if view is None:
+            pya.QMessageBox.warning(self, "No Layout", "No layout view is active.")
+            return
+
+        try:
+            cv = view.active_cellview()
+            layout = cv.layout()
+            cell = cv.cell
+        except Exception:
+            pya.QMessageBox.warning(self, "No Active Cell", "Active cell not found.")
+            return
+
+        if layout is None or cell is None:
+            pya.QMessageBox.warning(self, "No Active Cell", "Active cell not found.")
+            return
+
+        # Read globals
+        min_mod = self._get_float(self.leMinMod, 0.0, 0.0, 100.0)
+        pitch_units = self._get_float(self.leBeamPitchUnits, 4.0, 1.0, None)
+        pitch_nm = self._beam_pitch_nm(pitch_units)
+        area_shot_cm2 = self._area_per_shot_cm2(pitch_nm)
+        self.labelBeamPitchNmValue.setText(f"{pitch_nm:g}")
+
+        # Read group 1
+        current1 = self._get_float(self.leCurrent1, 6.0, 0.01, 100.0)
+        base_dose1 = self._get_float(self.leDose1, 2000.0, 1.0, None)
+        layers1 = self._selected_layers(self.layersList1)
+        min_dose1 = self._min_dose(base_dose1, min_mod)
+        q_shot1_C = self._charge_per_shot_C(min_dose1, area_shot_cm2)
+        f1_Hz = self._scanner_freq_Hz(current1, q_shot1_C)
+        shot1_ns = 1e9 / f1_Hz if f1_Hz &gt; 0 else 0.0
+        ith1_nA = self._threshold_current_nA(q_shot1_C) if q_shot1_C &gt; 0 else 0.0
+
+        # Read group 2 (if double)
+        is_double = self.rbDouble.isChecked()
+        if is_double:
+            current2 = self._get_float(self.leCurrent2, 4.0, 0.01, 100.0)
+            base_dose2 = self._get_float(self.leDose2, 2000.0, 1.0, None)
+            layers2 = self._selected_layers(self.layersList2)
+            min_dose2 = self._min_dose(base_dose2, min_mod)
+            q_shot2_C = self._charge_per_shot_C(min_dose2, area_shot_cm2)
+            f2_Hz = self._scanner_freq_Hz(current2, q_shot2_C)
+            shot2_ns = 1e9 / f2_Hz if f2_Hz &gt; 0 else 0.0
+            ith2_nA = self._threshold_current_nA(q_shot2_C) if q_shot2_C &gt; 0 else 0.0
+        else:
+            current2 = None
+            base_dose2 = None
+            layers2 = []
+            min_dose2 = 0.0
+            q_shot2_C = 0.0
+            f2_Hz = 0.0
+            shot2_ns = 0.0
+            ith2_nA = 0.0
+
+        # ----- Compute areas in mm² for selected layers -----
+        def total_area_mm2_for_layers(layer_infos):
+            if not layer_infos:
+                return 0.0
+            total_um2 = 0.0
+            for li in layer_infos:
+                try:
+                    layer_index = layout.layer(li)
+                except Exception:
+                    continue
+                try:
+                    shapes = layout.begin_shapes(cell, layer_index)  # non-recursive
+                except Exception:
+                    continue
+                while not shapes.at_end():
+                    try:
+                        total_um2 += shapes.shape().darea()
+                    except Exception:
+                        pass
+                    shapes.next()
+            return total_um2 / 1_000_000.0  # µm² -&gt; mm²
+
+        area1_mm2 = total_area_mm2_for_layers(layers1)
+        area2_mm2 = total_area_mm2_for_layers(layers2) if is_double else 0.0
+
+        # ----- Apply machine cap: if frequency &gt; 200 MHz (shot &lt; 5 ns), clamp current to I_thr -----
+        eff_current1 = min(current1, ith1_nA) if ith1_nA &gt; 0 else current1
+        eff_current2 = min(current2, ith2_nA) if is_double and ith2_nA &gt; 0 else (current2 if is_double else None)
+
+        # ----- Compute write times (s) using clamped effective currents -----
+        # seconds = min_dose[µC/cm²] * area[mm²] / current[nA] * 10
+        t1_s = (min_dose1 * area1_mm2 / max(eff_current1, 1e-12)) * 10.0 if area1_mm2 &gt; 0 else 0.0
+        t2_s = (min_dose2 * area2_mm2 / max(eff_current2, 1e-12)) * 10.0 if (is_double and area2_mm2 &gt; 0 and eff_current2 is not None) else 0.0
+        t_total_s = t1_s + t2_s
+
+        # ----- Update per-group info labels -----
+        self.labelMinDose1Value.setText(f"{min_dose1:g}")
+        self.labelFreq1Value.setText(f"{f1_Hz/1e6:0.3f}")
+        self.labelShot1Value.setText(f"{shot1_ns:0.3f}")
+        self.labelIth1Value.setText(f"{ith1_nA:0.3f}")
+
+        if is_double:
+            self.labelMinDose2Value.setText(f"{min_dose2:g}")
+            self.labelFreq2Value.setText(f"{f2_Hz/1e6:0.3f}")
+            self.labelShot2Value.setText(f"{shot2_ns:0.3f}")
+            self.labelIth2Value.setText(f"{ith2_nA:0.3f}")
+        else:
+            self.labelMinDose2Value.setText("")
+            self.labelFreq2Value.setText("")
+            self.labelShot2Value.setText("")
+            self.labelIth2Value.setText("")
+
+        # ----- Build result columns -----
+        layerText = "Layer/Datatype"
+        areaText = "Area [mm²]"
+        timeText = "Write Time"
+
+        for li in layers1:
+            name = li.to_s()
+            # per-layer display uses group totals; if you want per-layer time, we can compute later
+            # show area per layer (optional: here we show group total only)
+        if area1_mm2 &gt; 0:
+            layerText += "\n" + "Group 1 (selected)"
+            areaText  += "\n" + f"{area1_mm2:0.6f}"
+            timeText  += "\n" + self.getSecondsToTime(t1_s)
+
+        if is_double and area2_mm2 &gt; 0:
+            layerText += "\n" + "Group 2 (selected)"
+            areaText  += "\n" + f"{area2_mm2:0.6f}"
+            timeText  += "\n" + self.getSecondsToTime(t2_s)
+
+        # Totals
+        tArea = area1_mm2 + area2_mm2
+        layerText += "\n" + "Total"
+        areaText  += "\n" + f"{tArea:0.6f}"
+        timeText  += "\n" + self.getSecondsToTime(t_total_s)
+
+        # Cost in Kr
+        rate_kr_per_hr = self._get_float(self.leRateKr, 600.0, 1.0, None)
+        cost_kr = (t_total_s / 3600.0) * rate_kr_per_hr
+
+        # Display combined results
+        self.labelTotalTime.setText("Estimated Print Time [hh:mm:ss]")
+        self.labelTotalTimeValue.setText(self.getSecondsToTime(t_total_s))
+        self.labelCost.setText("Estimated Print Cost [Kr]")
+        self.labelCostValue.setText(f"{cost_kr:.2f}")
+        self.labelLayer.setText(layerText)
+        self.labelArea.setText(areaText)
+        self.labelTime.setText(timeText)
+
+        # Reset button text (placeholder for potential progress UI)
+        self.bCalc.setText("Estimate Write Time")
+        self.repaint()
+
+
+# Instantiate the dialog and make it visible initially.
+# Passing the main_window will make it stay on top of the main window.
+dialog = calcWriteTimeEBL(pya.Application.instance().main_window())
+dialog.show()</text>
+</klayout-macro>
