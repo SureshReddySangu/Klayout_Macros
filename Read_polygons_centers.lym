@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<klayout-macro>
+ <description/>
+ <version/>
+ <category>pymacros</category>
+ <prolog/>
+ <epilog/>
+ <doc/>
+ <autorun>false</autorun>
+ <autorun-early>false</autorun-early>
+ <priority>0</priority>
+ <shortcut/>
+ <show-in-menu>false</show-in-menu>
+ <group-name/>
+ <menu-path/>
+ <interpreter>python</interpreter>
+ <dsl-interpreter-name/>
+ <text>import pya
+
+# ── Configure these ──────────────────────────────────────────
+# Specify layers as (layer_number, datatype) tuples
+target_layers = [
+    (20, 0)
+    # add more as needed
+]
+
+output_path = "polygon_centers.txt"
+# ─────────────────────────────────────────────────────────────
+
+
+view = pya.Application.instance().main_window().current_view()
+cv = view.active_cellview()
+layout = cv.layout()
+cell = cv.cell
+dbu = layout.dbu
+
+# ── Debug: print all layers present in the layout ────────────
+print("=== Layers in layout ===")
+for li in layout.layer_indices():
+    info = layout.get_info(li)
+    print(f"  Layer {info.layer}/{info.datatype}  (index {li})")
+print("========================")
+
+count = 0
+
+with open(output_path, "w") as f:
+    f.write("Cell\tLayer\tDatatype\tCenter_X_um\tCenter_Y_um\tCenter_X_mm\tCenter_Y_mm\n")
+    for layer_num, datatype in target_layers:
+        li = layout.find_layer(layer_num, datatype)
+
+        # find_layer returns -1 (not None) when the layer doesn't exist
+        if li &lt; 0:
+            print(f"Layer {layer_num}/{datatype} NOT found in layout — skipping")
+            continue
+
+        # Recursive: reads shapes from this cell AND all subcells, flattened
+        for shape in cell.begin_shapes_rec(li).each():
+            if shape.shape().is_polygon() or shape.shape().is_box() or shape.shape().is_path():
+                poly = shape.shape().polygon.transformed(shape.trans())
+                center = poly.bbox().center()
+                cx = center.x * dbu
+                cx_mm = cx/1000
+                cy = center.y * dbu
+                cy_mm = cy/1000
+                f.write(f"{cell.name}\t{layer_num}\t{datatype}\t{cx:.4f}\t{cy:.4f}\t{cx_mm:.4f}\t{cy_mm:.4f}\n")
+                count += 1
+
+print(f"Exported {count} centers")
+pya.MessageBox.info("Done", f"Exported {count} centers to:\n{output_path}", pya.MessageBox.Ok)</text>
+</klayout-macro>
